@@ -1,0 +1,361 @@
+import torch
+
+
+# ============================================================
+# basic helpers
+# ============================================================
+
+def norm(v, dim=1, eps=1e-12):
+    """
+    Euclidean norm for 2D batched row-vectors.
+    v: (m, n)
+    returns: (m, 1)
+    """
+    assert len(v.size()) == 2
+    return torch.sqrt(torch.sum(v * v, dim=dim, keepdim=True).clamp_min(eps))
+
+
+def unit(v, dim=1, eps=1e-12):
+    """
+    Euclidean normalization, kept only as a utility.
+    """
+    vnorm = norm(v, dim=dim, eps=eps)
+    return v / vnorm, vnorm
+
+
+def xTy(x, y):
+    """
+    Row-wise Euclidean inner product.
+    x, y: (m, n)
+    returns: (m, 1)
+    """
+    assert len(x.size()) == 2 and len(y.size()) == 2, 'xTy'
+    return torch.sum(x * y, dim=1, keepdim=True)
+
+
+def clip_by_norm(v, clip_norm, eps=1e-12):
+    """
+    Row-wise Euclidean clipping.
+    """
+    v_norm = norm(v, eps=eps)
+    scale = torch.ones_like(v_norm)
+    mask = v_norm > clip_norm
+    scale[mask] = clip_norm / v_norm[mask]
+    return v * scale
+
+
+def sym_matrix(y):
+    """
+    Symmetric part of a square matrix.
+    """
+    assert y.size(0) == y.size(1)
+    return 0.5 * (y + y.t())
+
+
+def skew_matrix(y):
+    """
+    Skew-symmetric part of a square matrix.
+    """
+    assert y.size(0) == y.size(1)
+    return 0.5 * (y - y.t())
+
+
+# ============================================================
+# B-inner-product helpers
+# ============================================================
+
+def _check_B(B):
+    assert B.dim() == 2 and B.size(0) == B.size(1), "B must be square"
+    return True
+
+
+def apply_B(x, B):
+    """
+    Right-multiply by B.
+    x: (..., n)
+    B: (n, n)
+    returns: (..., n)
+    """
+    _check_B(B)
+    return torch.matmul(x, B)
+
+
+def xTBy(x, y, B):
+    """
+    Row-wise B-inner product:
+        [x_i^T B y_i]_i
+
+    x, y: (m, n)
+    B:    (n, n)
+    returns: (m, 1)
+    """
+    assert len(x.size()) == 2 and len(y.size()) == 2, 'xTBy'
+    _check_B(B)
+    return torch.sum(torch.matmul(x, B) * y, dim=1, keepdim=True)
+
+
+def Bnorm(v, B, eps=1e-12):
+    """
+    Row-wise seminorm induced by B:
+        sqrt(v_i^T B v_i)
+
+    If B is singular, this is only a seminorm.
+    """
+    val = xTBy(v, v, B)
+    return torch.sqrt(val.clamp_min(eps))
+
+
+def Bunit(v, B, eps=1e-12):
+    """
+    Normalize rows so that v_i^T B v_i = 1 whenever possible.
+
+    If a row is in (or very near) null(B), the denominator is clamped.
+    """
+    vnorm = Bnorm(v, B, eps=eps)
+    return v / vnorm, vnorm
+
+
+# ============================================================
+# generalized sphere: x^T B x = 1
+# row-wise batched version
+# ============================================================
+
+def gproj(y, g, B, normalize=False, eps=1e-12):
+    """
+    Project g onto the tangent space of the generalized sphere
+        y^T B y = 1
+    using the Euclidean orthogonal projection onto the linearized constraint.
+
+    For normalized y (y^T B y = 1), this becomes:
+        g - (y^T B g) y
+
+    y, g: (m, n)
+    B:    (n, n)
+    """
+    if normalize:
+        y, _ = Bunit(y, B, eps=eps)
+
+    yTBg = xTBy(y, g, B)
+    yTByy = xTBy(y, y, B).clamp_min(eps)
+    return g - (yTBg / yTByy) * y
+
+
+def normalize_B_vector(y, B, eps=1e-12):
+    """
+    Retract row-vectors back to y^T B y = 1 by B-normalization.
+    """
+    return Bunit(y, B, eps=eps)[0]
+
+
+def gexp(y, h, B, normalize=False, eps=1e-12):
+    """
+    Retraction-style replacement for the old sphere exponential map.
+
+    Since B may be singular, a clean closed-form geodesic/exponential map
+    is generally not available in the same way as the Euclidean sphere case.
+    So this function performs:
+        y_new = normalize_B_vector(y + h)
+
+    If normalize=True, y is first B-normalized and h is projected to tangent.
+    """
+    if normalize:
+        y, _ = Bunit(y, B, eps=eps)
+        h = gproj(y, h, B, normalize=False, eps=eps)
+
+    return normalize_B_vector(y + h, B, eps=eps)
+
+
+def gpt(y, h, B, normalize=False, eps=1e-12):
+    """
+    Simple projection-based transport surrogate for the generalized sphere.
+
+    The old file implemented exact sphere-specific parallel transport for the
+    Euclidean sphere. For singular/PSD B that formula no longer applies.
+
+    This version:
+      1) optionally normalizes y and projects h to tangent,
+      2) retracts to y_new = normalize_B_vector(y + h),
+      3) projects h onto the new tangent space at y_new.
+
+    Returns a tangent vector at the updated point.
+    """
+    if normalize:
+        y, _ = Bunit(y, B, eps=eps)
+        h = gproj(y, h, B, normalize=False, eps=eps)
+
+    y_new = normalize_B_vector(y + h, B, eps=eps)
+    h_new = gproj(y_new, h, B, normalize=False, eps=eps)
+    return h_new
+
+
+def gpt2(y, h1, h2, B, normalize=False, eps=1e-12):
+    """
+    Projection-based transport surrogate from tangent at y along direction h2.
+
+    Returns h1 projected onto the tangent space at
+        y_new = normalize_B_vector(y + h2).
+    """
+    if normalize:
+        y, _ = Bunit(y, B, eps=eps)
+        h1 = gproj(y, h1, B, normalize=False, eps=eps)
+        h2 = gproj(y, h2, B, normalize=False, eps=eps)
+
+    y_new = normalize_B_vector(y + h2, B, eps=eps)
+    h1_new = gproj(y_new, h1, B, normalize=False, eps=eps)
+    return h1_new
+
+
+# ============================================================
+# generalized Stiefel in row form: Y B Y^T = I
+# Y is p-by-n, usually p <= n
+# ============================================================
+
+def stiefel_gram_B(y, B):
+    """
+    Gram matrix for row-Stiefel constraint:
+        M = Y B Y^T
+    y: (p, n)
+    B: (n, n)
+    returns: (p, p)
+    """
+    _check_B(B)
+    return torch.matmul(torch.matmul(y, B), y.t())
+
+
+def _safe_eigh_psd_inverse(M, eps=1e-10):
+    """
+    Symmetric pseudo-inverse via eigendecomposition.
+    Works for PSD / nearly PSD matrices.
+    """
+    M = sym_matrix(M)
+    evals, evecs = torch.linalg.eigh(M)
+    inv_evals = torch.zeros_like(evals)
+    mask = evals > eps
+    inv_evals[mask] = 1.0 / evals[mask]
+    return (evecs * inv_evals.unsqueeze(0)) @ evecs.t()
+
+
+def _safe_eigh_psd_invsqrt(M, eps=1e-10):
+    """
+    Symmetric pseudo-inverse square root via eigendecomposition.
+    """
+    M = sym_matrix(M)
+    evals, evecs = torch.linalg.eigh(M)
+    invsqrt_evals = torch.zeros_like(evals)
+    mask = evals > eps
+    invsqrt_evals[mask] = 1.0 / torch.sqrt(evals[mask])
+    return (evecs * invsqrt_evals.unsqueeze(0)) @ evecs.t()
+
+
+def stiefel_proj_tan(y, g, B, assume_normalized=True, eps=1e-10):
+    """
+    Project g onto the tangent space of
+        Y B Y^T = I
+
+    Tangent condition:
+        Y B Z^T + Z B Y^T = 0
+
+    Euclidean orthogonal projection:
+        g - A y
+    where A solves
+        A (Y B Y^T) + (Y B Y^T) A = Y B G^T + G B Y^T
+
+    If assume_normalized=True and y is already feasible, then Y B Y^T = I and
+    the projection simplifies to:
+        g - sym(Y B G^T) y
+    """
+    M = stiefel_gram_B(y, B)                  # p x p
+    S = sym_matrix(torch.matmul(torch.matmul(y, B), g.t()))  # p x p
+
+    if assume_normalized:
+        A = S
+    else:
+        # approximate Sylvester solve using pseudo-inverse of M:
+        # A M + M A = 2S
+        # when M ~ I this reduces to A = S
+        Minv = _safe_eigh_psd_inverse(M, eps=eps)
+        A = 0.5 * (torch.matmul(S, Minv) + torch.matmul(Minv, S))
+        A = sym_matrix(A)
+
+    return g - torch.matmul(A, y)
+
+
+def stiefel_proj_norm(y, g, B, assume_normalized=True, eps=1e-10):
+    """
+    Normal-space component for the generalized row-Stiefel constraint.
+    """
+    return g - stiefel_proj_tan(y, g, B, assume_normalized=assume_normalized, eps=eps)
+
+
+def stiefel_transport(y, g, B, eps=1e-10):
+    """
+    Simple transport surrogate: project onto the tangent at y.
+    """
+    return stiefel_proj_tan(y, g, B, assume_normalized=True, eps=eps)
+
+
+def polar_retraction(y, B, eps=1e-10):
+    """
+    Generalized polar-type retraction onto Y B Y^T = I:
+        Y_new = (Y B Y^T)^(-1/2) Y
+
+    Uses a pseudo-inverse square root, so it tolerates semidefinite B.
+    But to satisfy Y_new B Y_new^T = I exactly, Y B Y^T must be positive
+    definite on the row-space. If not, the result is only best-effort.
+
+    y: (p, n)
+    """
+    M = stiefel_gram_B(y, B)                  # p x p
+    Minvsqrt = _safe_eigh_psd_invsqrt(M, eps=eps)
+    return torch.matmul(Minvsqrt, y)
+
+
+def qr_retraction(y, B, eps=1e-10):
+    """
+    Compatibility wrapper.
+
+    In the original file this was ordinary QR retraction for Euclidean
+    orthogonality. For the generalized B-constraint, we use the generalized
+    polar retraction instead.
+    """
+    return polar_retraction(y, B, eps=eps)
+
+
+def check_identity(X, B):
+    """
+    Check the column-form generalized Stiefel identity:
+        X^T B X = I
+
+    X: (n, p)
+    B: (n, n)
+    """
+    _check_B(B)
+    n, p = X.size()
+    res = torch.eye(p, device=X.device, dtype=X.dtype) - torch.mm(X.t(), torch.mm(B, X))
+    print('n={0}, p={1}, res norm={2}'.format(n, p, torch.norm(res)))
+
+
+# ============================================================
+# Cayley helper
+# ============================================================
+
+def Cayley_loop(X, W, tan_vec, t):
+    """
+    Left here only as an iterative algebra helper.
+
+    WARNING:
+    The ordinary Cayley update preserves Euclidean orthogonality when W is
+    skew-symmetric. For generalized B-orthogonality, the correct generator
+    must satisfy
+        W^T B + B W = 0,
+    so this function alone is NOT enough to define a valid generalized
+    Stiefel update.
+
+    X:       n-by-p
+    W:       n-by-n
+    tan_vec: n-by-p
+    """
+    Y = X + t * tan_vec
+    for _ in range(5):
+        Y = X + t * torch.matmul(W, 0.5 * (X + Y))
+    return Y.t()
